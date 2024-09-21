@@ -7,7 +7,6 @@ import (
 	"loc-cli/count"
 	"log"
 	"os"
-	"strings"
 )
 
 func main() {
@@ -30,8 +29,8 @@ func main() {
 		}
 		fmt.Printf("Counting lines at repo \"%s\"...\n", *repoCountFlag)
 		countCommand.Run()
-		fmt.Printf("\nLines count: %v\n\n", loc.Count)
-		fmt.Printf("Files: %v\n\nTotal of %v files\n\n", strings.Join(loc.Files, ", "), len(loc.Files))
-		fmt.Printf("Directories: %v\n\nTotal of %v directories", strings.Join(loc.Dirs, ", "), len(loc.Dirs))
+		fmt.Printf("\nLines count: %v\n", loc.Count)
+		fmt.Printf("Total Files: %v\n", len(loc.Files))
+		fmt.Printf("Total Directories: %v", len(loc.Dirs))
 	}
 }

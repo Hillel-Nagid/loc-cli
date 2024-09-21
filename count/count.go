@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"loc-cli/filetree"
 	"loc-cli/utils"
 	"log"
 	"os"
 	"path"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -23,31 +25,15 @@ func CountLines(target *Result, args ...any) error {
 	done := make(chan struct{})
 	ctx, cancel := context.WithCancelCause(context.Background())
 	var result Result
-	if len(args) != 5 {
-		return fmt.Errorf("not enough arguments")
+	dir, recursive, includeBlanks, includeComments, ignoreList, err := parseArgs(args)
+	if err != nil {
+		return err
 	}
-	dir, ok := args[0].(*string)
-	if !ok {
-		return fmt.Errorf("first argument must be a string")
+	tree, err := filetree.NewFileTree(*dir, ignoreList)
+	if err != nil {
+		return err
 	}
-	ignore, ok := args[1].(*string)
-	if !ok {
-		return fmt.Errorf("second argument must be a string")
-	}
-	recursive, ok := args[2].(*bool)
-	if !ok {
-		return fmt.Errorf("third argument must be a boolean")
-	}
-	includeBlanks, ok := args[3].(*bool)
-	if !ok {
-		return fmt.Errorf("fourth argument must be a boolean")
-	}
-	includeComments, ok := args[4].(*bool)
-	if !ok {
-		return fmt.Errorf("fifth argument must be a boolean")
-	}
-	ignoreList := strings.Split(strings.ReplaceAll(*ignore, " ", ""), ",")
-	go dirLineCounter(ctx, cancel, true, *dir, ignoreList, *recursive, *includeBlanks, *includeComments, done, &result)
+	go dirLineCounter(ctx, cancel, true, *dir, ignoreList, *recursive, *includeBlanks, *includeComments, done, &result, tree)
 	select {
 	case <-ctx.Done():
 		switch ctx.Err() {
@@ -60,24 +46,21 @@ func CountLines(target *Result, args ...any) error {
 	return nil
 }
 
-func dirLineCounter(ctx context.Context, cancel context.CancelCauseFunc, root bool, dir string, ignoreList []string, recursive bool, includeBlanks bool, includeComments bool, done chan struct{}, result *Result) {
+func dirLineCounter(ctx context.Context, cancel context.CancelCauseFunc, root bool, dir string, ignoreList []string, recursive bool, includeBlanks bool, includeComments bool, done chan struct{}, result *Result, tree *filetree.FileTree) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		cancel(err)
 	}
 	if len(entries) > 1 {
 		if len(entries) <= 4 {
-			// fmt.Println("started processing few")
 			entryDoneCh := make(chan struct{}, 1)
 			for _, entry := range entries {
-				go proceessEntry(ctx, cancel, dir, ignoreList, recursive, includeBlanks, includeComments, entryDoneCh, result, entry)
+				go processEntry(ctx, cancel, dir, ignoreList, recursive, includeBlanks, includeComments, entryDoneCh, result, entry, tree)
 			}
 			for i := 0; i < len(entries); i++ {
 				<-entryDoneCh
 			}
-			// fmt.Println("finished processing few")
 		} else {
-			// fmt.Println("started processing splits")
 			mod := len(entries) % 4
 			div := len(entries) / 4
 			var splits [][]fs.DirEntry
@@ -90,39 +73,36 @@ func dirLineCounter(ctx context.Context, cancel context.CancelCauseFunc, root bo
 			}
 			splitsDoneCh := make(chan struct{}, 1)
 			for _, split := range splits {
-				go processEntries(ctx, cancel, dir, ignoreList, recursive, includeBlanks, includeComments, splitsDoneCh, result, split)
+				go processEntries(ctx, cancel, dir, ignoreList, recursive, includeBlanks, includeComments, splitsDoneCh, result, split, tree)
 			}
-			// fmt.Printf("each split is %v entries:\n1. %v\n2. %v\n3. %v\n4. %v\n", div, splits[0], splits[1], splits[2], splits[3])
 			for i := 0; i < 4; i++ {
 				<-splitsDoneCh
 			}
 		}
-		// fmt.Println("finished processing splits")
 	} else if len(entries) == 1 {
-		// fmt.Println("started processing single")
-		processEntries(ctx, cancel, dir, ignoreList, recursive, includeBlanks, includeComments, done, result, entries)
+		processEntry(ctx, cancel, dir, ignoreList, recursive, includeBlanks, includeComments, done, result, entries[0], tree)
 		<-done
-		// fmt.Println("finished processing single")
 	}
 	if root {
 		cancel(nil)
 	}
 }
-func proceessEntry(ctx context.Context, cancel context.CancelCauseFunc, dir string, ignoreList []string, recursive bool, includeBlanks bool, includeComments bool, done chan struct{}, result *Result, entry fs.DirEntry) {
+func processEntry(ctx context.Context, cancel context.CancelCauseFunc, dir string, ignoreList []string, recursive bool, includeBlanks bool, includeComments bool, done chan struct{}, result *Result, entry fs.DirEntry, tree *filetree.FileTree) {
 	defer func() { done <- struct{}{} }()
+	entryPath := path.Join(dir, entry.Name())
 	if entry.IsDir() {
 		if strings.HasPrefix(entry.Name(), ".") || slices.Contains(ignoreList, entry.Name()) {
 			return
 		}
-		fmt.Printf("Reading directory %s\n", entry.Name())
-		dirLineCounter(ctx, cancel, false, path.Join(dir, entry.Name()), ignoreList, recursive, includeBlanks, includeComments, done, result)
+		dirLineCounter(ctx, cancel, false, entryPath, ignoreList, recursive, includeBlanks, includeComments, done, result, tree)
 		result.Dirs = append(result.Dirs, entry.Name())
 	} else {
 		if strings.HasSuffix(entry.Name(), ".sum") || slices.Contains(ignoreList, entry.Name()) {
 			return
 		}
-		fmt.Printf("Reading file %s...\n", path.Join(dir, entry.Name()))
-		if fileContent, err := os.ReadFile(path.Join(dir, entry.Name())); err != nil {
+		tree.Loading(len(result.Files))
+		time.Sleep(time.Millisecond * 200)
+		if fileContent, err := os.ReadFile(entryPath); err != nil {
 			cancel(err)
 			return
 		} else {
@@ -137,18 +117,46 @@ func proceessEntry(ctx context.Context, cancel context.CancelCauseFunc, dir stri
 					}
 					return true
 				})
+				tree.ChangeFileStatus(entryPath, filetree.DoneEntryStatus)
 				result.Files = append(result.Files, entry.Name())
 				result.Count += len(contentLines)
 			}
 		}
 	}
-	return
 }
-func processEntries(ctx context.Context, cancel context.CancelCauseFunc, dir string, ignoreList []string, recursive bool, includeBlanks bool, includeComments bool, done chan struct{}, result *Result, entries []fs.DirEntry) {
+func processEntries(ctx context.Context, cancel context.CancelCauseFunc, dir string, ignoreList []string, recursive bool, includeBlanks bool, includeComments bool, done chan struct{}, result *Result, entries []fs.DirEntry, tree *filetree.FileTree) {
 	entryDoneCh := make(chan struct{}, 1)
 	for _, entry := range entries {
-		proceessEntry(ctx, cancel, dir, ignoreList, recursive, includeBlanks, includeComments, entryDoneCh, result, entry)
+		processEntry(ctx, cancel, dir, ignoreList, recursive, includeBlanks, includeComments, entryDoneCh, result, entry, tree)
 		<-entryDoneCh
 	}
 	done <- struct{}{}
+}
+
+func parseArgs(args []any) (dir *string, recursive *bool, includeBlanks *bool, includeComments *bool, ignoreList []string, err error) {
+	if len(args) != 5 {
+		err = fmt.Errorf("not enough arguments")
+	}
+	dir, ok := args[0].(*string)
+	if !ok {
+		err = fmt.Errorf("first argument must be a string")
+	}
+	ignore, ok := args[1].(*string)
+	if !ok {
+		err = fmt.Errorf("second argument must be a string")
+	}
+	recursive, ok = args[2].(*bool)
+	if !ok {
+		err = fmt.Errorf("third argument must be a boolean")
+	}
+	includeBlanks, ok = args[3].(*bool)
+	if !ok {
+		err = fmt.Errorf("fourth argument must be a boolean")
+	}
+	includeComments, ok = args[4].(*bool)
+	if !ok {
+		err = fmt.Errorf("fifth argument must be a boolean")
+	}
+	ignoreList = strings.Split(strings.ReplaceAll(*ignore, " ", ""), ",")
+	return
 }
